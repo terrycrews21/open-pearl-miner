@@ -1,0 +1,7 @@
+.venv/
+.deps/
+__pycache__/
+*.pyc
+libp40cuda.so
+logs/
+*.tar.gz
