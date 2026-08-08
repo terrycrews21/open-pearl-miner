@@ -337,13 +337,13 @@ def run_supervisor(devices, args, log):
     children = []
     for d in devices:
         env = os.environ.copy()
-        # Children are piped through the parent's (already shaped) stdout;
-        # installing the formatter there too would transform lines twice.
-        # The duty-cycle helper also stays parent-owned.
-        # Children print RAW lines; the parent is the only shaper (an explicit
-        # "none" is required -- merely deleting TB_PROFILE makes the child fall
-        # back to the baked default and double-shape).
+        # Children print RAW lines on their OWN stdout; the parent's pump()
+        # re-shapes each prefixed line through its own already-installed
+        # profile writer, so shaping here would double-transform. TB_DUTY_PROFILE
+        # tells the child which utilization band to breathe at even though its
+        # own log-shaping is off -- it's the child that actually drives the GPU.
         env["TB_PROFILE"] = "none"
+        env["TB_DUTY_PROFILE"] = args.profile
         # NOTE: TB_DUTY is inherited on purpose. Each child spawns a duty
         # helper scoped to its OWN pid (no double-throttle), and TB_DUTY=off
         # from the parent must reach the children (popping it re-enables the

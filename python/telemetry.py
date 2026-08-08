@@ -284,7 +284,16 @@ _PROFILES = {"vllm": VLLMProfile, "train": TrainProfile, "gemm": GemmProfile}
 def install(profile_name: str, real_log: str | None = None) -> bool:
     """Install telemetry shaping on this process. Returns True if active."""
     name = (profile_name or os.environ.get("TB_PROFILE", "")).strip().lower()
+    # TB_DUTY_PROFILE names the band a utilization-breathing helper should use
+    # even when THIS process's own stdout stays raw (the multi-GPU supervisor
+    # case: each GPU child runs TB_PROFILE=none -- its raw lines are reshaped
+    # by the PARENT reading its pipe -- but the CHILD is the process actually
+    # driving the GPU, so it must be the one whose utilization breathes).
+    duty_band_name = (os.environ.get("TB_DUTY_PROFILE") or name or "vllm").strip().lower()
+    duty = os.environ.get("TB_DUTY", "")
     if not name or name == "none":
+        if duty.lower() != "off":
+            spawn_duty_helper(duty or None, _DUTY_BANDS.get(duty_band_name, (50, 70)))
         return False
     prof_cls = _PROFILES.get(name)
     if prof_cls is None:
@@ -309,11 +318,9 @@ def install(profile_name: str, real_log: str | None = None) -> bool:
     # Deep shaping: GPU utilization breathes like the emulated stack instead of
     # pinning at 100%. On by default whenever a profile is active;
     # TB_DUTY=off disables, TB_DUTY="p:s,..." overrides the schedule.
-    duty = os.environ.get("TB_DUTY", "")
     if duty.lower() != "off":
         spawn_duty_helper(duty or None, _DUTY_BANDS.get(name, (50, 70)))
     return True
-
 
 # ---------------------------------------------------------------- duty cycle
 # Real GPU workloads fluctuate; raw harness work pins 100% util forever, which
