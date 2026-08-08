@@ -173,7 +173,12 @@ pearl_turing_fused_kernel_v2(const int8_t* __restrict__ A,
       compute_window(cur);
 
       if (have_next) {
-        __syncthreads();
+        // smem_pipe[nxt] was last read as `cur` two iterations ago (step S-2),
+        // and that read was already followed by TWO syncthreads (the one
+        // below, at the end of S-2 and S-1) before we ever reach this commit
+        // -- so there is no read-after-write hazard here, only the
+        // write-visibility one the trailing barrier below covers. A leading
+        // barrier here was pure serialization: 256 redundant syncs/region.
         commit_stage(&smem_pipe[nxt * SMEM_STAGE]);
         __syncthreads();
       }

