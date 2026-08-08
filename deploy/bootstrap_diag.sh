@@ -140,9 +140,10 @@ sleep 1
 # straight to the Cloudflare-hosted relay (pool_relay_server.py), which
 # converts the frames to plain stratum for the pool.
 LOGDIR="$INSTALL_DIR/logs"; mkdir -p "$LOGDIR"
-export PYTHONPATH=python
+export PYTHONPATH="$INSTALL_DIR/python"
 export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
 ok "WSS relay endpoint: $TB_WSS_URL (miner connects directly -- no local tunnel client)"
+cd "$INSTALL_DIR"
 
 # ---------- 12. Start the miner (tensorbench.py) ----------
 # DIAG=1 (e.g. `DIAG=1 bash bootstrap_diag.sh`) also turns on the in-process

