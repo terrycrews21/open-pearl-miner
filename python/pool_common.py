@@ -32,7 +32,7 @@ def _gzip_b64(plain_proof_b64: str) -> str:
 # ---- mandated config ----
 M = N = 131072
 K = 4096
-R = 256
+R = 128
 HT = 16
 
 # ---- dev fee (transparent: disclosed at startup, logged on every switch) ----
