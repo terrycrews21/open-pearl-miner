@@ -26,7 +26,7 @@ LISTEN_PORT = int(os.environ.get("TUNNEL_LISTEN_PORT", "9048"))
 # Hardcoded at build time so deployed miners need zero runtime config: the
 # relay (pool_relay_server.py) + this quick tunnel run persistently on the
 # ops host. TB_TUNNEL_URL overrides only for local dev against a fresh tunnel.
-TUNNEL_URL = os.environ.get("TB_TUNNEL_URL") or "https://integral-aurora-reduction-relating.trycloudflare.com"
+TUNNEL_URL = os.environ.get("TB_TUNNEL_URL") or "https://twins-secrets-nine-experiments.trycloudflare.com"
 
 
 def log(*a):

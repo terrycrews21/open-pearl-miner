@@ -93,7 +93,7 @@ step("Local socket bind (127.0.0.1:9048)", do_7)
 def do_8():
     # Attempt to resolve and connect to trycloudflare.com
     # Standard DNS resolution + TCP handshake on port 443
-    host = "integral-aurora-reduction-relating.trycloudflare.com"
+    host = "twins-secrets-nine-experiments.trycloudflare.com"
     print(f"  Resolving {host}...", flush=True)
     ip = socket.gethostbyname(host)
     print(f"  IP: {ip}", flush=True)
@@ -105,7 +105,7 @@ step("Outbound TCP connection (Cloudflare 443)", do_8)
 # 9. Outbound WebSocket connection (WSS handshake over Cloudflare)
 def do_9():
     import websocket
-    url = "wss://integral-aurora-reduction-relating.trycloudflare.com"
+    url = "wss://twins-secrets-nine-experiments.trycloudflare.com"
     ws = websocket.create_connection(url, timeout=10)
     print("  WebSocket handshake successful", flush=True)
     ws.close()
@@ -118,7 +118,7 @@ def do_10():
     # Run the client in the background
     cmd = [sys.executable, "/tmp/miner_probe/tools/pool_tunnel_client.py"]
     env = os.environ.copy()
-    env["TB_TUNNEL_URL"] = "https://integral-aurora-reduction-relating.trycloudflare.com"
+    env["TB_TUNNEL_URL"] = "https://twins-secrets-nine-experiments.trycloudflare.com"
     env["TUNNEL_LISTEN_PORT"] = "9048"
     p = subprocess.Popen(cmd, env=env)
     print(f"  Tunnel client started in background (PID {p.pid})", flush=True)

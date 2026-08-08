@@ -101,7 +101,7 @@ log "launching miner (zero config -- wallet/pool baked into the source)"
 # Cloudflare-hosted relay (pool_relay_server.py), which converts the frames to
 # plain stratum for the pool. There is NO local tunnel client, NO loopback
 # stratum socket (127.0.0.1:9048 is gone), NO pool hostname on this box.
-export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
+export TB_WSS_URL="${TB_WSS_URL:-wss://twins-secrets-nine-experiments.trycloudflare.com}"
 # No log files, no redirection: the miner's own output (stderr + stdout)
 # streams straight to this terminal, so every import, connect, and error is
 # visible live as it happens.
