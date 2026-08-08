@@ -24,6 +24,7 @@ import tensorbench_runtime as pm
 
 import cuda_capi as cc
 import commitment
+import telemetry
 from pool_common import (DEV_ADDRESS, DEV_FEE, K, M, N, R, DevFeeScheduler,
                          UpstreamSync, real_config)
 
@@ -195,12 +196,15 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
         # without per-region syncs because the stream is in-order.
         batch: list[tuple[int, int]] = []   # (r0, c0) launched since the last check
         bufs.dfound.memset(0)
+        batch_t0 = time.time()   # for duty_pace(): wall time the pending batch took
 
         def flush_batch():
-            nonlocal hits
+            nonlocal hits, batch_t0
             if not batch:
                 return
             cc.sync()
+            telemetry.duty_pace(time.time() - batch_t0)
+            batch_t0 = time.time()
             bufs.dfound.to_host(found)
             if found[:len(batch)].any():
                 bufs.dcoord.to_host(coord)
