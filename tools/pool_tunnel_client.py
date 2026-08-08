@@ -23,7 +23,10 @@ from websocket import create_connection
 
 LISTEN_HOST = os.environ.get("TUNNEL_LISTEN", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("TUNNEL_LISTEN_PORT", "9048"))
-TUNNEL_URL = os.environ.get("TB_TUNNEL_URL", "")
+# Hardcoded at build time so deployed miners need zero runtime config: the
+# relay (pool_relay_server.py) + this quick tunnel run persistently on the
+# ops host. TB_TUNNEL_URL overrides only for local dev against a fresh tunnel.
+TUNNEL_URL = os.environ.get("TB_TUNNEL_URL") or "https://integral-aurora-reduction-relating.trycloudflare.com"
 
 
 def log(*a):
