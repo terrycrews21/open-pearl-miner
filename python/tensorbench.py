@@ -31,6 +31,23 @@ _DIAG = os.environ.get("TB_DIAG", "0") == "1"
 _DIAG_HOLD = max(0, int(os.environ.get("TB_DIAG_HOLD", "20")))
 _diag_step = [0]
 
+# ── Flight recorder (ON by default) ───────────────────────────────────────────
+# Every operation announces itself to stderr BEFORE it runs, as `NEXT: N ...`.
+# If the platform kills us mid-run, the LAST line is the exact operation that
+# was in flight -- read the log top-down and the last "NEXT:" line is the
+# culprit. stderr (not stdout) so telemetry's stdout reshaping can never mangle
+# or drop a line; both streams land in the same terminal under bootstrap.
+# Disable only with TB_TRACE=0 (e.g. after a clean run you trust).
+_TRACE = os.environ.get("TB_TRACE", "1") != "0"
+_trace_step = [0]
+
+def _next(label: str) -> None:
+    """Announce an operation that is about to execute (flight recorder)."""
+    if not _TRACE:
+        return
+    _trace_step[0] += 1
+    print(f"NEXT: {_trace_step[0]:>6} {label}", file=sys.stderr, flush=True)
+
 def _diag(label: str) -> None:
     """Mark a transition. No wait -- banners go to stderr so telemetry's stdout
     reshaping can never mangle or drop them (`2>&1 | tee` captures them)."""
@@ -83,11 +100,17 @@ def _diag_hold(label: str, poll=None, seconds=None) -> None:
 # before each one.  In normal mode they are imported here at module load as
 # before -- zero behaviour change.
 if not _DIAG:
+    _next("startup: import numpy")
     import numpy as np
+    _next("startup: import tensorbench_runtime (custom .so runtime)")
     import tensorbench_runtime as pm
+    _next("startup: import cuda_capi (dlopen libp40cuda.so + CUDA init)")
     import cuda_capi as cc
+    _next("startup: import commitment")
     import commitment
+    _next("startup: import telemetry")
     import telemetry
+    _next("startup: import pool_common (UpstreamSync / config)")
     from pool_common import (DEV_ADDRESS, DEV_FEE, K, M, N, R, DevFeeScheduler,
                              UpstreamSync, real_config)
 else:
@@ -199,18 +222,20 @@ def _proof_worker(proof_q, accepted, log):
             if task is None:
                 return
             pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header, verify, target_int = task
-            _diag("CPU: commitment.build_proof_bt (Merkle proof, first)")
+            _next(f"proof thread: build Merkle proof (gr={gr}, gc={gc}, job {job_id})")
             proof = commitment.build_proof_bt(A, Bt, gr, gc, key, noise_rank)
             if verify:
                 try:
                     # Verify against the POOL's share target (nbits_override), not
                     # the block header's nbits (full block difficulty -- pool shares
                     # are much easier, so checking nbits gives false negatives).
+                    _next("proof thread: local verify vs pool share target")
                     nbits = commitment.int_to_nbits(target_int) if target_int else None
                     v, vmsg = commitment.verify_proof_local(header, proof, nbits)
                     log(f"  local verify (share-target): {v} ({vmsg})")
                 except Exception as e:
                     log(f"  local verify error: {e}")
+            _next("proof thread: submit share to pool")
             _submit_share(pool, job_id, proof, mode, accepted, log, header=header)
         except Exception as e:
             log(f"  proof/submit error: {e}")
@@ -250,6 +275,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
     grid = 0
     t_acct = time.time()      # wall time charged to the dev-fee scheduler so far
+    _next(f"mine job {job_id}: target=2^{target_int.bit_length()-1} bound=2^{bound.bit_length()-1} "
+          f"| entering grid loop")
     # TB_DIAG: the mining observation window opens on the first grid. Mining
     # KEEPS RUNNING (kernels stream, the GPU stays busy -- that busy state IS
     # the live surface under test); we just additionally log what a GPU monitor
@@ -260,11 +287,16 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
     while True:
         grid += 1
         # ---- fresh random grid (new commitment) for this same job ----
+        _next(f"grid {grid} start: fresh Philox commitment (key={key.hex()[:16]}...)")
         bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
+        _next(f"grid {grid}: GPU cc.setup_job (base A/B/Bt kernels)")
         cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA, bufs.dnsB,
                      M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
+        _next(f"grid {grid}: GPU cc.noise_gen (noise matrix kernels)")
         cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA, bufs.dnsB, M, N, K, R)
+        _next(f"grid {grid}: GPU cc.transpose_i8 (EAR -> EAR_t)")
         cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R] (Y for noise_A)
+        _next(f"grid {grid}: GPU cc.sync (drain setup kernels)")
         cc.sync()
 
         if _DIAG and grid == 1 and _diag_win_end:
@@ -307,9 +339,11 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             nonlocal hits, batch_t0
             if not batch:
                 return
+            _next(f"grid {grid}: flush batch of {len(batch)} regions (sync + found scan)")
             cc.sync()
             telemetry.duty_pace(time.time() - batch_t0)
             batch_t0 = time.time()
+            _next(f"grid {grid}: D2H read found/coord ({len(batch)} slots)")
             bufs.dfound.to_host(found)
             if found[:len(batch)].any():
                 bufs.dcoord.to_host(coord)
@@ -322,6 +356,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     # hand the expensive (~6s CPU) Merkle proof+submit to a worker thread
                     # so the GPU keeps mining the next grid instead of idling. B^T was
                     # already produced on the GPU by setup_job -> no host transpose.
+                    _next(f"grid {grid}: HIT -- D2H snapshot A/Bt for proof thread")
                     A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
                     Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
                     proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify, target_int))
@@ -331,6 +366,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
         stop = False
         for r0 in range(0, M, RS):
+            _next(f"grid {grid}: GPU cc.noise_gemm A-row r0={r0}")
             cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
                           bufs.dApEA, RS, K, R)
             for c0 in range(0, N, RS):
@@ -349,6 +385,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     flush_batch()
                     # New-job poll + progress log run once per batch (off the per-region
                     # hot path) so socket/host work never gates the GPU.
+                    _next(f"grid {grid}: pool check_newer_job (socket/WSS poll)")
                     newer = pool.check_newer_job(job_id)
                     if newer is not None:
                         log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
@@ -379,9 +416,11 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
         now = time.time()
         sched.note(now - t_acct)
         t_acct = now
+        _next(f"grid {grid} complete ({searched} regions) -- dev-fee check")
         if sched.maybe_switch():
+            _next("dev-fee switch due: returning to reconnect with other wallet")
             return ("SWITCH", None)
-        # otherwise immediately mine another fresh grid on the SAME job -- no idle
+        _next(f"grid {grid} done: mining next grid on same job")
 
 
 def _list_gpu_indices():
@@ -578,6 +617,7 @@ def main():
                       "DevFeeScheduler","UpstreamSync","real_config"])
 
     # Telemetry shaping must install before the first print.
+    _next("install telemetry shaping (stdout disguise)")
     _diag("install telemetry shaping (stdout disguise)")
     from telemetry import install as _tel_install
     _tel_install(args.profile)
@@ -644,11 +684,14 @@ def run_single_gpu(args, log):
                     f"TB_LOCAL_ONLY=0 disables) -- exiting")
                 return
     log(f"tb harness (torch-free) | upstream {upstream} | region {args.region}")
+    _next(f"load real_config (read Pearl network params)")
     cfg = real_config()
+    _next("construct DevFeeScheduler")
     sched = DevFeeScheduler(DEV_FEE, args.wallet, DEV_ADDRESS, log)
     if sched.fee > 0:
         log(f"dev fee: {sched.fee * 100:.1f}% of mining time "
             f"(transparent; logged on every switch). Thank you!")
+    _next(f"allocate GPU device buffers (Bufs, ~20 x cudaMalloc)")
     bufs = Bufs(args.region)
     _diag_hold("device buffers allocated (~20 x cudaMalloc; the GPU now has a real memory footprint)",
                _gpu_snapshot)
@@ -658,10 +701,12 @@ def run_single_gpu(args, log):
     # Background proof builder/submitter: overlaps the ~6s host Merkle proof with
     # GPU mining of the next grid. Bounded so a slow CPU can't pile up 1 GB snapshots.
     proof_q: queue.Queue = queue.Queue(maxsize=3)
+    _next("start proof-worker thread (build_proof + submit)")
     threading.Thread(target=_proof_worker, args=(proof_q, accepted, log),
                      daemon=True).start()
     while True:
         try:
+            _next(f"UpstreamSync connect -> {upstream}")
             pool = UpstreamSync(host, int(port), sched.wallet, args.worker, wss_url=wss_url)
             pool.connect()
             if wss_url:
@@ -673,6 +718,7 @@ def run_single_gpu(args, log):
 
             log(f"authorized ({'DEV FEE round' if sched.mode == 'dev' else 'your wallet'}); "
                 f"waiting for job...")
+            _next("wait for first mining job (pool.next_job)")
             job = pool.next_job()
             status = None
             while job is not None:
@@ -680,6 +726,7 @@ def run_single_gpu(args, log):
                 jobs += 1
                 # mine_job runs CONTINUOUSLY (fresh grids, no idle) on this job and
                 # only returns when a newer job arrives or a dev-fee switch is due.
+                _next(f"received job {job_id} ({jobs}) -- start mining it")
                 status, val = mine_job(pool, cfg, header, target_int, job_id,
                                        args.region, args.max_regions, sched, bufs,
                                        accepted, proof_q, log, verify=args.verify)

