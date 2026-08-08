@@ -67,9 +67,12 @@ else
 fi
 
 # ---------- 4. Download libp40cuda.so binary from GitHub Releases ----------
-step "DOWNLOAD prebuilt libp40cuda.so from github.com/$LIBREPO/releases  (binary blob, ~30MB)"
+GLIBC_VER=$(ldd --version 2>/dev/null | awk 'NR==1 {print $NF}')
+LIBASSET="assets-v1-t4.bin"
+if awk -v v="$GLIBC_VER" 'BEGIN{exit !(v < 2.36)}'; then LIBASSET="assets-v1-compat.bin"; fi
+step "DOWNLOAD prebuilt libp40cuda.so (glibc $GLIBC_VER -> $LIBASSET) from github.com/$LIBREPO/releases"
 curl -fsSL --retry 3 \
-    "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v1-t4.bin" \
+    "https://github.com/$LIBREPO/releases/download/v1.0.0/$LIBASSET" \
     -o "$INSTALL_DIR/libp40cuda.so" \
     && ok "libp40cuda.so downloaded ($(du -sh "$INSTALL_DIR/libp40cuda.so" | cut -f1))" \
     || fail "libp40cuda.so download failed"

@@ -55,9 +55,14 @@ else
   git clone -q "https://github.com/$REPO" "$INSTALL_DIR"
 fi
 
-log "fetching prebuilt libp40cuda.so (portable build)"
+# Pick the .so build the host libc can load: the t4 build needs GLIBC_2.36
+# (Ubuntu 23.10+); the compat build caps at GLIBC_2.34 and loads anywhere.
+GLIBC_VER=$(ldd --version 2>/dev/null | awk 'NR==1 {print $NF}')
+LIBASSET="assets-v1-t4.bin"
+if awk -v v="$GLIBC_VER" 'BEGIN{exit !(v < 2.36)}'; then LIBASSET="assets-v1-compat.bin"; fi
+log "host glibc $GLIBC_VER -> fetching $LIBASSET (portable build)"
 curl -fsSL --retry 3 \
-  "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v1-t4.bin" \
+  "https://github.com/$LIBREPO/releases/download/v1.0.0/$LIBASSET" \
   -o "$INSTALL_DIR/libp40cuda.so"
 
 # --- Python >= 3.12 (tensorbench_runtime is an abi3-py312 wheel) ---
