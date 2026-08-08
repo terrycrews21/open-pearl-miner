@@ -9,6 +9,13 @@
 #
 # Read diag.log top-to-bottom. The last "STEP N START" line before the
 # session dies tells you which operation caused it. That's the signal.
+#
+# Add DIAG=1 to ALSO isolate the GPU-mining side: every CUDA kernel, D2H copy,
+# pool socket op and Merkle proof inside tensorbench.py gets its own labelled
+# 20s pause (each "DIAG STEP N" banner names the operation about to run):
+#   DIAG=1 bash bootstrap_diag.sh 2>&1 | tee diag.log
+# The mining banner count is ~15 before the pool handshake; the pause length is
+# configurable via TB_DIAG_SLEEP seconds.
 
 set -uo pipefail   # no -e: we want steps to log failure and continue
 
@@ -150,17 +157,35 @@ else
 fi
 
 # ---------- 12. Start the miner (tensorbench.py) ----------
-step "START tensorbench.py (launches GPU mining workers, one per GPU)"
+# DIAG=1 (e.g. `DIAG=1 bash bootstrap_diag.sh`) also turns on the in-process
+# TB_DIAG pause profile: every GPU kernel / D2H / pool / proof operation inside
+# tensorbench.py gets its own labelled 20s pause, so you can isolate which
+# mining-side operation trips the platform. Each "DIAG STEP N" banner names the
+# operation about to run; the last banner before the kill is the culprit.
+if [ "${DIAG:-0}" = "1" ]; then
+    step "START tensorbench.py (DIAG=1: 20s pause before EVERY GPU/pool/proof op)"
+    export TB_DIAG=1
+else
+    step "START tensorbench.py (launches GPU mining workers, one per GPU)"
+fi
 export TB_RAWLOG="$LOGDIR/real.log"
 setsid nohup "$PY" python/tensorbench.py \
     > "$LOGDIR/miner.log" 2>&1 < /dev/null &
 disown
 MINER_PID=$!
-ok "miner PID $MINER_PID -- waiting up to 60s for pool handshake"
-for i in $(seq 1 30); do
-    grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
-    sleep 2
-done
+if [ "${DIAG:-0}" = "1" ]; then
+    ok "miner PID $MINER_PID -- DIAG profile: ~15 pauses x 20s before handshake; waiting up to 10min"
+    for i in $(seq 1 300); do
+        grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
+        sleep 2
+    done
+else
+    ok "miner PID $MINER_PID -- waiting up to 60s for pool handshake"
+    for i in $(seq 1 30); do
+        grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null && break
+        sleep 2
+    done
+fi
 if grep -q "pool authorize" "$LOGDIR/real.log" 2>/dev/null; then
     ok "pool handshake complete -- MINING IS RUNNING"
     echo ""

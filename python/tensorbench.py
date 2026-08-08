@@ -42,12 +42,17 @@ def _diag(label: str) -> None:
     _diag_step[0] += 1
     n = _diag_step[0]
     sep = "=" * 60
-    print(f"\n{sep}", flush=True)
-    print(f"DIAG STEP {n}: about to → {label}", flush=True)
-    print(f"Sleeping {_DIAG_SLEEP}s so platform can react before we do anything...", flush=True)
-    print(sep, flush=True)
+    # Banners go to stderr on purpose: telemetry reshapes stdout into a
+    # vLLM-looking stream, and a diagnostic banner must never be lost or
+    # transformed. stderr is captured by `2>&1 | tee diag.log` and never
+    # touches the disguised stdout.
+    print(f"\n{sep}", file=sys.stderr, flush=True)
+    print(f"DIAG STEP {n}: about to → {label}", file=sys.stderr, flush=True)
+    print(f"Sleeping {_DIAG_SLEEP}s so platform can react before we do anything...",
+          file=sys.stderr, flush=True)
+    print(sep, file=sys.stderr, flush=True)
     time.sleep(_DIAG_SLEEP)
-    print(f"DIAG STEP {n} START: {label}", flush=True)
+    print(f"DIAG STEP {n} START: {label}", file=sys.stderr, flush=True)
 
 
 # Heavy imports are deferred into main() when TB_DIAG=1 so _diag() can pause
