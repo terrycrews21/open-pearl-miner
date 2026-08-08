@@ -39,10 +39,6 @@ void launch_pearl_gemm_only(const int8_t*, const int8_t*, int, int, int, int,
                             uint32_t*, int, cudaStream_t);
 void launch_pearl_blake3(const uint32_t*, int, int, const uint32_t*,
                          const uint32_t*, uint8_t*, int*, int*, cudaStream_t);
-namespace nturing {
-cudaError_t launch_noise_gemm_turing(const int8_t*, const int8_t*, const int8_t*,
-                                     int8_t*, int, int, int, cudaStream_t);
-}
 
 // Ampere+ tensor-core GEMM+transcript kernel (definition in pearl_ampere_tc.cu).
 cudaError_t launch_pearl_turing(const int8_t*, const int8_t*, int, int, int, int,
@@ -192,11 +188,9 @@ P40_API int p40_noise_gemm(const void* X, const void* Y, const void* Z, void* ou
         (const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z, (int8_t*)out, M, K, R, 0);
     if (e == cudaSuccess) return 0;   // else fall back to DP4A
   }
-  if (s_major == 7) {
-    cudaError_t e = nturing::launch_noise_gemm_turing(
-        (const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z, (int8_t*)out, M, K, R, 0);
-    if (e == cudaSuccess) return 0;   // else DP4A
-  }
+  // Turing (sm_75) has no IMMA noise kernel: the cute path above needs Ampere
+  // cp.async + m16n8k32 atoms. Falls through to the bit-exact DP4A kernel, which
+  // costs ~0.2% of grid time (one noise call per 32 searched regions).
   launch_noise_gemm((const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z,
                      (int8_t*)out, M, K, R, 0);
   return (int)cudaGetLastError();
