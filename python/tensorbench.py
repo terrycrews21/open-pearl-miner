@@ -355,7 +355,11 @@ def run_supervisor(devices, args, log):
         # Wallet + worker + tuning travel via env, never argv: child cmdlines
         # stay clean (`ps` shows only the interpreter + script).
         env["TB_ACCOUNT"] = args.wallet
-        env["TB_TAG"] = f"{args.worker}-gpu{d}"
+        # One machine = one pool worker by default: all GPUs report under the
+        # same worker name so the pool shows a single row with combined
+        # hashrate. TB_SPLIT_WORKERS=1 restores per-GPU worker names.
+        tag = f"{args.worker}-gpu{d}" if os.environ.get("TB_SPLIT_WORKERS") == "1" else args.worker
+        env["TB_TAG"] = tag
         env["TB_REGION"] = str(args.region)
         if args.pool:
             env["TB_UPSTREAM"] = args.pool
@@ -366,7 +370,7 @@ def run_supervisor(devices, args, log):
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
         children.append((d, p))
         threading.Thread(target=pump, args=(d, p), daemon=True).start()
-        log(f"launched GPU {d} -> worker {args.worker}-gpu{d} (pid {p.pid})")
+        log(f"launched GPU {d} -> worker {tag} (pid {p.pid})")
 
     try:
         while True:
