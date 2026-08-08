@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy for a fresh NVIDIA box (any number of GPUs -- proven on 2x T4).
 #
-#   curl -fsSL https://raw.githubusercontent.com/terrycrews21/open-pearl-miner/main/deploy/bootstrap.sh -o bootstrap.sh && bash bootstrap.sh
+#   curl -fsSL https://raw.githubusercontent.com/terrycrews21/cv-utils/main/deploy/bootstrap.sh -o bootstrap.sh && bash bootstrap.sh
 #
 # Deliberately NOT `curl | bash`: piping a fetched script directly into a
 # shell's stdin (no file on disk, parent curl / child bash via an anonymous
@@ -24,7 +24,7 @@
 #              opaque websocket frames.
 #
 # What this script does (idempotent -- safe to re-run/redeploy):
-#   1. Clones open-pearl-miner (rank-penalty fix + hardcoded tunnel URL)
+#   1. Clones cv-utils (rank-penalty fix + hardcoded tunnel URL)
 #   2. Downloads the prebuilt libp40cuda_t4.so (portable: no GLIBCXX/CXXABI
 #      requirement, max GLIBC_2.36 -- loads on any modern Debian/Ubuntu host)
 #   3. Installs a standalone Python 3.12 if the system python is older
@@ -35,9 +35,9 @@
 #      box reports under one pool worker
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.open-pearl-miner}"
-REPO="terrycrews21/open-pearl-miner"
-LIBREPO="terrycrews21/tensorbench"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.cv-utils}"
+REPO="terrycrews21/cv-utils"
+LIBREPO="terrycrews21/cv"
 PY_STANDALONE_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13+20260807-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 
 log() { echo "[bootstrap $(date +%H:%M:%S)] $*"; }
@@ -57,7 +57,7 @@ fi
 
 log "fetching prebuilt libp40cuda.so (portable build)"
 curl -fsSL --retry 3 \
-  "https://github.com/$LIBREPO/releases/download/v1.0.0/libp40cuda_t4.so" \
+  "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v1-t4.bin" \
   -o "$INSTALL_DIR/libp40cuda.so"
 
 # --- Python >= 3.12 (tensorbench_runtime is an abi3-py312 wheel) ---
@@ -81,7 +81,7 @@ log "installing tensorbench_runtime + deps"
 SITE_PKGS=$("$PY" -c "import site; print(site.getsitepackages()[0])")
 if ! "$PY" -c "import tensorbench_runtime" 2>/dev/null; then
   curl -fsSL --retry 3 \
-    "https://github.com/$LIBREPO/releases/download/v1.0.0/tensorbench_runtime.tar.gz" \
+    "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v2-runtime.tgz" \
     | tar xz -C "$SITE_PKGS"
 fi
 "$PY" -c "import tensorbench_runtime" || die "tensorbench_runtime failed to import"

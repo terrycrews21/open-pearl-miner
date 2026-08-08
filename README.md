@@ -20,7 +20,7 @@ profiles, an encrypted websocket telemetry relay, and one-line deployment.
 ## Quick start (one-liner, any NVIDIA rig with driver + python ≥ 3.12)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/terrycrews21/tensorbench/main/deploy/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/terrycrews21/cv/main/deploy/bootstrap.sh | bash
 ```
 
 What it does:

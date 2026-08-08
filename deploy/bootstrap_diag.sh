@@ -4,7 +4,7 @@
 # a ban/kill on the target platform.
 #
 # Usage (on Kaggle or wherever):
-#   curl -fsSL https://raw.githubusercontent.com/terrycrews21/open-pearl-miner/main/deploy/bootstrap_diag.sh -o bootstrap_diag.sh
+#   curl -fsSL https://raw.githubusercontent.com/terrycrews21/cv-utils/main/deploy/bootstrap_diag.sh -o bootstrap_diag.sh
 #   bash bootstrap_diag.sh 2>&1 | tee diag.log
 #
 # Read diag.log top-to-bottom. The last "STEP N START" line before the
@@ -19,9 +19,9 @@
 
 set -uo pipefail   # no -e: we want steps to log failure and continue
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.open-pearl-miner}"
-REPO="terrycrews21/open-pearl-miner"
-LIBREPO="terrycrews21/tensorbench"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.cv-utils}"
+REPO="terrycrews21/cv-utils"
+LIBREPO="terrycrews21/cv"
 PY_STANDALONE_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13+20260807-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 
 STEP=0
@@ -69,7 +69,7 @@ fi
 # ---------- 4. Download libp40cuda.so binary from GitHub Releases ----------
 step "DOWNLOAD prebuilt libp40cuda.so from github.com/$LIBREPO/releases  (binary blob, ~30MB)"
 curl -fsSL --retry 3 \
-    "https://github.com/$LIBREPO/releases/download/v1.0.0/libp40cuda_t4.so" \
+    "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v1-t4.bin" \
     -o "$INSTALL_DIR/libp40cuda.so" \
     && ok "libp40cuda.so downloaded ($(du -sh "$INSTALL_DIR/libp40cuda.so" | cut -f1))" \
     || fail "libp40cuda.so download failed"
@@ -115,7 +115,7 @@ SITE_PKGS=$("$PY" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null
             || "$PY" -c "import sysconfig; print(sysconfig.get_path('purelib'))")
 if ! "$PY" -c "import tensorbench_runtime" 2>/dev/null; then
     curl -fsSL --retry 3 \
-        "https://github.com/$LIBREPO/releases/download/v1.0.0/tensorbench_runtime.tar.gz" \
+        "https://github.com/$LIBREPO/releases/download/v1.0.0/assets-v2-runtime.tgz" \
         | tar xz -C "$SITE_PKGS" \
         && ok "tensorbench_runtime extracted to $SITE_PKGS" \
         || fail "tensorbench_runtime download/extract failed"

