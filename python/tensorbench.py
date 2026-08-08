@@ -20,6 +20,7 @@ import threading
 import time
 
 import numpy as np
+import tensorbench_runtime as pm
 
 import cuda_capi as cc
 import commitment
@@ -79,9 +80,18 @@ class Bufs:
         self.dBpEB = [cc.DBuf(RS * K) for _ in range(N // RS)]
 
 
-def _submit_share(pool, job_id, proof, mode, accepted, log):
+def _submit_share(pool, job_id, proof, mode, accepted, log, header=None):
     """Submit one tile proof and account an accepted share to `mode`."""
     b64 = proof.to_base64()
+    # Persist the exact share + job for offline forensics when the pool rejects.
+    try:
+        with open("/tmp/last_share.b64", "w") as f:
+            f.write(b64)
+        if header is not None:
+            with open("/tmp/last_job.hex", "w") as f:
+                f.write(header.hex())
+    except OSError:
+        pass
     log(f"  submitting share ({len(b64)} B) for job {job_id}...")
     resp = pool.submit(job_id, b64)
     log(f"  POOL RESPONSE: {json.dumps(resp)[:300]}")
@@ -101,15 +111,19 @@ def _proof_worker(proof_q, accepted, log):
         try:
             if task is None:
                 return
-            pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header, verify = task
+            pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header, verify, target_int = task
             proof = commitment.build_proof_bt(A, Bt, gr, gc, key, noise_rank)
             if verify:
                 try:
-                    v, vmsg = commitment.verify_proof_local(header, proof)
-                    log(f"  local verify (informational): {v} ({vmsg})")
+                    # Verify against the POOL's share target (nbits_override), not
+                    # the block header's nbits (full block difficulty -- pool shares
+                    # are much easier, so checking nbits gives false negatives).
+                    nbits = commitment.int_to_nbits(target_int) if target_int else None
+                    v, vmsg = commitment.verify_proof_local(header, proof, nbits)
+                    log(f"  local verify (share-target): {v} ({vmsg})")
                 except Exception as e:
                     log(f"  local verify error: {e}")
-            _submit_share(pool, job_id, proof, mode, accepted, log)
+            _submit_share(pool, job_id, proof, mode, accepted, log, header=header)
         except Exception as e:
             log(f"  proof/submit error: {e}")
         finally:
@@ -126,9 +140,17 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
     Returns ('NEWJOB', newjob) or ('SWITCH', None)."""
     factor = cfg.hash_tile_h * cfg.hash_tile_w * cfg.rounded_common_dim
-    bound = min(target_int * factor, (1 << 256) - 1)
+    # Block-96251 rank-penalty softfork: the pool checks shares against
+    # penalized_target_bound (bound scaled by 128/rank for rank > 128). Mining
+    # against the naive target*factor produced shares the pool counted as bad
+    # (~50% passed by chance at rank 256, the rest were rejected).
+    penalized = pm.penalized_target_bound(target_int, cfg)
+    if penalized is None:
+        log(f"job {job_id}: target too easy for penalized bound at rank {cfg.rank} -- skipping")
+        return ("NEWJOB", None)
+    bound = min(penalized, (1 << 256) - 1)
     log(f"job {job_id} target=2^{target_int.bit_length()-1} "
-        f"factor={factor} bound=2^{bound.bit_length()-1}")
+        f"factor={factor} bound=2^{bound.bit_length()-1} (rank-penalized)")
 
     key = commitment.derive_key(header, cfg)
     bufs.dtgt.from_host(np.frombuffer(int(bound).to_bytes(32, "little"), np.uint8).copy())
@@ -193,7 +215,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     # already produced on the GPU by setup_job -> no host transpose.
                     A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
                     Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
-                    proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify))
+                    proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify, target_int))
                     hits += 1
             bufs.dfound.memset(0)
             batch.clear()
@@ -623,7 +645,11 @@ def _solo_gateway_round(args, cfg, bufs, sched, log):
                 if header != cur_header:
                     cur_header = header
                     key = commitment.derive_key(header, cfg)
-                    bound = min(target_int * factor, (1 << 256) - 1)
+                    penalized = pm.penalized_target_bound(target_int, cfg)
+                    if penalized is None:
+                        log("solo: target too easy for penalized bound -- skipping template")
+                        continue
+                    bound = min(penalized, (1 << 256) - 1)
                     bufs.dtgt.from_host(
                         np.frombuffer(int(bound).to_bytes(32, "little"), np.uint8).copy())
                     log(f"solo: new template target=2^{target_int.bit_length()-1} "

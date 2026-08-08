@@ -32,7 +32,11 @@ def _gzip_b64(plain_proof_b64: str) -> str:
 # ---- mandated config ----
 M = N = 131072
 K = 4096
-R = 128
+R = 256  # GPU kernels are bit-exact vs the Rust reference at this rank
+# (jackpot fold assumes k/rank chunks; 4096/256 = 16 = JACKPOT_SIZE).
+# Rank >= 128 satisfies the block-96251 rank-penalty softfork; the pool
+# tightens the fairness bound by 128/rank, which mine_job applies via
+# pm.penalized_target_bound.
 HT = 16
 
 # ---- dev fee (transparent: disclosed at startup, logged on every switch) ----

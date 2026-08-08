@@ -68,11 +68,23 @@ def derive_key(header_bytes: bytes, mining_config) -> bytes:
     return blake3.blake3(header_bytes + mining_config.to_bytes()).digest()
 
 
-def verify_proof_local(header_bytes: bytes, proof, nbits: int | None = None):
+def int_to_nbits(target: int) -> int:
+    """Bitcoin-style compact target encoding (matches zk-pow's nbits decode)."""
+    if target <= 0:
+        return 0
+    size = (target.bit_length() + 7) // 8
+    if size <= 3:
+        compact = target << (8 * (3 - size))
+    else:
+        compact = target >> (8 * (size - 3))
+    if compact & 0x800000:
+        compact >>= 8
+        size += 1
+    return (size << 24) | compact
+
+
+def verify_proof_local(header_bytes: bytes, proof, nbits: int | None = None, cert_version: int = 2):
     hdr = pm.IncompleteBlockHeader.from_bytes(header_bytes)
-    try:
-        if nbits is not None:
-            return pm.verify_plain_proof(hdr, proof, nbits)
-        return pm.verify_plain_proof(hdr, proof)
-    except TypeError:
-        return pm.verify_plain_proof(hdr, proof)
+    # verify_plain_proof_for_cert_version(cert_version, block_header, plain_proof,
+    # nbits_override=None) — the only plain-verify surface the runtime exposes.
+    return pm.verify_plain_proof_for_cert_version(cert_version, hdr, proof, nbits)
