@@ -8,6 +8,7 @@ tensorbench_runtime). Bundles to a <100 MB binary.
 """
 from __future__ import annotations
 
+
 import argparse
 import json
 import os
@@ -19,14 +20,68 @@ import sys
 import threading
 import time
 
-import numpy as np
-import tensorbench_runtime as pm
+# ── _DIAG needs os in scope first ─────────────────────────────────────────────
+_DIAG = os.environ.get("TB_DIAG", "0") == "1"
+# Pause length per step. Overridable so you can stretch the window on a slow ban:
+#   TB_DIAG=1 TB_DIAG_SLEEP=60 python tensorbench.py
+_DIAG_SLEEP = max(0, int(os.environ.get("TB_DIAG_SLEEP", "20")))
+_diag_step = [0]
+# Labels are deduped: a label inside a hot loop (e.g. pearl_pow_split, called
+# hundreds of thousands of times) only gets its 20s pause + banner on its FIRST
+# occurrence. So the whole launch profile is: import -> cuda init -> malloc ->
+# setup_job -> noise_gen -> transpose -> sync -> noise_gemm -> pearl_pow_split ->
+# found-scan -> pool poll -> proof -> submit, each isolated, exactly once.
+_diag_seen: set = set()
 
-import cuda_capi as cc
-import commitment
-import telemetry
-from pool_common import (DEV_ADDRESS, DEV_FEE, K, M, N, R, DevFeeScheduler,
-                         UpstreamSync, real_config)
+def _diag(label: str) -> None:
+    if not _DIAG:
+        return
+    if label in _diag_seen:
+        return
+    _diag_seen.add(label)
+    _diag_step[0] += 1
+    n = _diag_step[0]
+    sep = "=" * 60
+    print(f"\n{sep}", flush=True)
+    print(f"DIAG STEP {n}: about to → {label}", flush=True)
+    print(f"Sleeping {_DIAG_SLEEP}s so platform can react before we do anything...", flush=True)
+    print(sep, flush=True)
+    time.sleep(_DIAG_SLEEP)
+    print(f"DIAG STEP {n} START: {label}", flush=True)
+
+
+# Heavy imports are deferred into main() when TB_DIAG=1 so _diag() can pause
+# before each one.  In normal mode they are imported here at module load as
+# before -- zero behaviour change.
+if not _DIAG:
+    import numpy as np
+    import tensorbench_runtime as pm
+    import cuda_capi as cc
+    import commitment
+    import telemetry
+    from pool_common import (DEV_ADDRESS, DEV_FEE, K, M, N, R, DevFeeScheduler,
+                             UpstreamSync, real_config)
+else:
+    # Placeholders so the rest of the module-level code (class Bufs etc.) can
+    # still be parsed.  Actual imports happen in _diag_import() called from main().
+    np = pm = cc = commitment = telemetry = None          # type: ignore[assignment]
+    DEV_ADDRESS = DEV_FEE = K = M = N = R = None         # type: ignore[assignment]
+    DevFeeScheduler = UpstreamSync = real_config = None  # type: ignore[assignment]
+
+def _diag_import(name: str, module_name: str, from_names: list | None = None):
+    """Import `module_name`, optionally pulling `from_names` into the calling
+    module's global namespace, preceded by a _diag pause."""
+    import importlib
+    _diag(f"import {module_name}" + (f"  ({', '.join(from_names)})" if from_names else ""))
+    mod = importlib.import_module(module_name)
+    g = globals()
+    if from_names:
+        for attr in from_names:
+            g[attr] = getattr(mod, attr)
+    else:
+        g[module_name.split(".")[-1]] = mod
+    return mod
+
 
 VARIANT = 1  # pearl_pow_split S=128 4x4 MINB4
 
@@ -94,6 +149,7 @@ def _submit_share(pool, job_id, proof, mode, accepted, log, header=None):
     except OSError:
         pass
     log(f"  submitting share ({len(b64)} B) for job {job_id}...")
+    _diag("pool: pool.submit (stratum share, first)")
     resp = pool.submit(job_id, b64)
     log(f"  POOL RESPONSE: {json.dumps(resp)[:300]}")
     if resp and resp.get("result") is True:
@@ -113,6 +169,7 @@ def _proof_worker(proof_q, accepted, log):
             if task is None:
                 return
             pool, job_id, A, Bt, gr, gc, key, noise_rank, mode, header, verify, target_int = task
+            _diag("CPU: commitment.build_proof_bt (Merkle proof, first)")
             proof = commitment.build_proof_bt(A, Bt, gr, gc, key, noise_rank)
             if verify:
                 try:
@@ -167,10 +224,14 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
         grid += 1
         # ---- fresh random grid (new commitment) for this same job ----
         bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
+        _diag("GPU: cc.setup_job (first kernel launch of a grid)")
         cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA, bufs.dnsB,
                      M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
+        _diag("GPU: cc.noise_gen (noise matrix kernels)")
         cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA, bufs.dnsB, M, N, K, R)
+        _diag("GPU: cc.transpose_i8 (transpose kernel)")
         cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R] (Y for noise_A)
+        _diag("GPU: cc.sync (cudaDeviceSynchronize)")
         cc.sync()
 
         searched = 0
@@ -185,6 +246,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             if idx not in computed:
                 # Z = base B^T rows [c0:c0+RS], which setup_job already produced in
                 # dBt_full -- re-transposing dB here was redundant (a ~1.9% kernel).
+                _diag("GPU: cc.noise_gemm (B^T noise, first column block)")
                 cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL,
                               bufs.dBt_full.offset(c0 * K), d, RS, K, R)
                 computed.add(idx)
@@ -205,6 +267,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
             cc.sync()
             telemetry.duty_pace(time.time() - batch_t0)
             batch_t0 = time.time()
+            _diag("D2H: to_host read found/coord")
             bufs.dfound.to_host(found)
             if found[:len(batch)].any():
                 bufs.dcoord.to_host(coord)
@@ -217,6 +280,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     # hand the expensive (~6s CPU) Merkle proof+submit to a worker thread
                     # so the GPU keeps mining the next grid instead of idling. B^T was
                     # already produced on the GPU by setup_job -> no host transpose.
+                    _diag("D2H: to_host read winning A/B^T (hit)")
                     A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
                     Bt = np.empty((N, K), np.int8); bufs.dBt_full.to_host(Bt)
                     proof_q.put((pool, job_id, A, Bt, gr, gc, key, R, sched.mode, header, verify, target_int))
@@ -226,6 +290,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
 
         stop = False
         for r0 in range(0, M, RS):
+            _diag("GPU: cc.noise_gemm (A noise, row sweep)")
             cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
                           bufs.dApEA, RS, K, R)
             for c0 in range(0, N, RS):
@@ -236,6 +301,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                 slot = len(batch)
                 dBpEB = bt_noised(c0)
                 # digests=None: mining only needs found/coord. pow_key MUST be dnsA.
+                _diag("GPU: cc.pearl_pow_split (PoW tile scan, first tile)")
                 cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dnsA, bufs.dtgt,
                                    bufs.dtb, None, bufs.dfound.offset(slot * 4),
                                    bufs.dcoord.offset(slot * 8), VARIANT)
@@ -244,6 +310,7 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions,
                     flush_batch()
                     # New-job poll + progress log run once per batch (off the per-region
                     # hot path) so socket/host work never gates the GPU.
+                    _diag("pool: check_newer_job (socket poll)")
                     newer = pool.check_newer_job(job_id)
                     if newer is not None:
                         log(f"  newer job (grid {grid}, {searched} regions, {hits} hits this grid)")
@@ -442,8 +509,20 @@ def _env_config():
 def main():
     args = _env_config()
 
-    # Telemetry shaping (+ utilization duty-cycling inside install): must install
-    # before the first print so no raw harness telemetry ever reaches stdout.
+    if _DIAG:
+        # In diag mode: do all heavy imports here, one at a time, each preceded
+        # by a 20s pause so we can see which import triggers a ban.
+        _diag_import("np",                 "numpy")
+        _diag_import("pm",                 "tensorbench_runtime")
+        _diag_import("cc",                 "cuda_capi")           # ← ctypes.CDLL + CUDA init
+        _diag_import("commitment",         "commitment")
+        _diag_import("telemetry",          "telemetry")
+        _diag_import("pool_common", "pool_common",
+                     ["DEV_ADDRESS","DEV_FEE","K","M","N","R",
+                      "DevFeeScheduler","UpstreamSync","real_config"])
+
+    # Telemetry shaping must install before the first print.
+    _diag("install telemetry shaping (stdout disguise)")
     from telemetry import install as _tel_install
     _tel_install(args.profile)
 
@@ -476,6 +555,7 @@ def main():
         return
 
     # No flag: auto-detect. Multiple GPUs -> one worker each; single GPU -> run here.
+    _diag("enumerate GPUs via nvidia-smi / cc.device_count()")
     devs = _list_gpu_indices()
     if len(devs) > 1:
         log(f"multi-GPU: {len(devs)} GPUs {devs} | one worker per card | pool {args.pool or 'auto (per-GPU)'}")
@@ -484,6 +564,7 @@ def main():
     if devs:
         log(f"single GPU detected (index {devs[0]})")
     run_single_gpu(args, log)
+
 
 
 def run_single_gpu(args, log):
@@ -497,12 +578,15 @@ def run_single_gpu(args, log):
                 f"TB_LOCAL_ONLY=0 disables) -- exiting")
             return
     log(f"tb harness (torch-free) | upstream {args.pool} | region {args.region}")
+    _diag("real_config() — tensorbench_runtime: read Pearl network params (no GPU yet)")
     cfg = real_config()
     sched = DevFeeScheduler(DEV_FEE, args.wallet, DEV_ADDRESS, log)
     if sched.fee > 0:
         log(f"dev fee: {sched.fee * 100:.1f}% of mining time "
             f"(transparent; logged on every switch). Thank you!")
+    _diag("Bufs.__init__() — cc.DBuf() x ~20: allocate all GPU device buffers (cudaMalloc)")
     bufs = Bufs(args.region)
+
     accepted = {"user": 0, "dev": 0}
     jobs = 0
     # Background proof builder/submitter: overlaps the ~6s host Merkle proof with
@@ -512,10 +596,13 @@ def run_single_gpu(args, log):
                      daemon=True).start()
     while True:
         try:
+            _diag(f"UpstreamSync.connect() — open TCP socket + stratum handshake to {args.pool}")
             pool = UpstreamSync(host, int(port), sched.wallet, args.worker)
             pool.connect()
+
             log(f"authorized ({'DEV FEE round' if sched.mode == 'dev' else 'your wallet'}); "
                 f"waiting for job...")
+            _diag("pool: pool.next_job (receive job from pool)")
             job = pool.next_job()
             status = None
             while job is not None:
